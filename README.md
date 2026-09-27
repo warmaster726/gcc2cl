@@ -41,11 +41,12 @@ py gcc2cl.py --compiler gcc --arch x64 -- gcc -O2 -c hello.c -o hello.obj
 - Includes and defines: `-I`, `-isystem`, `-D`, `-U`, `-include` → `/I`, `/D`, `/U`, `/FI`
 - Build mode: `-c`, `-E`, `-S`, `-shared` → `/c`, `/P`, `/FA`, `/DLL`
 - Output: `-o app.exe` → `/Fe:app.exe`; one-source `-c -o file.obj` → `/Fo:file.obj`
-- Libraries: `-Ldir`, `-lfoo` → `/LIBPATH:dir`, `foo.lib`
-- Language and optimization: common `-std=c++14/17/20`, `-O0/1/2/3`, `-g`
-- Warnings and runtime: `-Wall`, `-Wextra`, `-Werror`, `-MD`, `-MDd`, `-MT`, `-MTd`
-- Common C++ switches: exception handling and RTTI flags
-- GCC response files such as `@options.rsp`
+- Libraries: `-Ldir`, `-lfoo` → `/LIBPATH:dir`, `foo.lib`; common Windows libraries such as `-lws2_32` → `ws2_32.lib`; MinGW runtime `-lm` is omitted because its functionality is supplied by the Windows/MSVC runtime
+- Linker options: common `-Wl,--subsystem,windows`, `-Wl,--out-implib,name.lib`, `-Wl,--entry,name`, `-Wl,-Map,file.map`, and `-mwindows`
+- Language and optimization: `-std=c89/99/11/17`, `-std=c++11/14/17/20/23`, `-O0/1/2/3`, `-g`
+- Warnings and compile flags: `-Wall`, `-Wextra`, `-Werror`, selected `-Wno-*`, `-fopenmp`, exception handling, and RTTI flags
+- Dependency flags: `-M`, `-MD`, `-MMD`, `-MF`, and `-MT` are detected and warned about rather than incorrectly mapped to MSVC runtime flags
+- GCC response files such as `@options.rsp`, including nested response files and cycle detection
 
 ## Automated installation and cleanup
 
@@ -86,6 +87,23 @@ The first result should be in `%USERPROFILE%\\gcc2cl-shims`. This catches normal
 
 It cannot intercept a build tool that invokes `C:\\MinGW\\bin\\gcc.exe` by absolute path, nor non-compiler tools such as `ld`, `ar`, `windres`, or `dlltool`. Those require separate adapters. A system-wide process-creation monitor or Image File Execution Options debugger is not recommended: it is race-prone, requires elevated privileges in many cases, can affect unrelated applications, and may create security or recursion problems. For absolute-path calls, configure the build system's compiler variable or use a CMake/compiler-launcher setting.
 
+## Validation
+
+Before committing changes, run the syntax check:
+
+```powershell
+python -m py_compile gcc2cl.py
+```
+
+Use dry-run commands to inspect the generated MSVC command without invoking Visual Studio:
+
+```powershell
+python gcc2cl.py --dry-run -- "gcc -Wuninitialized -std=c99 main.c Task1.c -o Task1 -lm"
+python gcc2cl.py --dry-run -- "g++ -std=c++17 -O2 -Wall main.cpp -o app.exe"
+```
+
+The first command should omit `m.lib`, because MSVC/Windows supplies the normal C math functions. Actual compilation and linking require Windows, Visual Studio Build Tools, the Windows SDK, compatible source code, and MSVC-compatible libraries. The previous translation test suite was run during development and removed before preparing the release branch.
+
 ## Important compatibility boundary
 
 There is no mathematically complete GCC-to-MSVC conversion: GCC and MSVC have different preprocessors, standard libraries, ABIs, linkers, built-in macros, warning sets, attributes, and runtime libraries. This script translates command-line syntax, not source-code incompatibilities.
@@ -103,3 +121,33 @@ For a real build integration, capture each compile/link command separately, tran
 ## Recommended next step for production use
 
 Use CMake's MSVC generator or a compiler launcher whenever possible. If the input commands come from a fixed build system, add a `rules.json` file for project-specific replacements, then have the translator reject unknown flags rather than silently ignoring them. The current script is intentionally conservative: it warns about unsupported switches and prints the exact command that will run.
+
+## Contributing with a branch and pull request
+
+Do not commit credentials or place a personal access token in a Git URL. Authenticate locally with GitHub CLI, Git Credential Manager, or SSH. From a fresh terminal:
+
+```powershell
+gh auth login
+git remote -v
+git fetch origin
+git switch -c improve-mingw-translation
+python -m py_compile gcc2cl.py
+git diff --check
+git status
+```
+
+Review the changes, then commit and push the branch:
+
+```powershell
+git add README.md gcc2cl.py Install-Gcc2Cl.ps1 Uninstall-Gcc2Cl.ps1 mingw-shim.cmd LICENSE
+git commit -m "Expand MinGW to MSVC command translation"
+git push --set-upstream origin improve-mingw-translation
+```
+
+Create a pull request with GitHub CLI:
+
+```powershell
+gh pr create --base main --head improve-mingw-translation --title "Expand MinGW to MSVC command translation" --body "Expands compiler, linker, library, language-mode, response-file, and diagnostic handling. Validation includes py_compile and dry-run command checks."
+```
+
+Alternatively, open the repository on GitHub after pushing and select **Compare & pull request**. Check the diff, confirm that no token or machine-specific path is included, and request review before merging.

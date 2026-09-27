@@ -1,188 +1,278 @@
 #!/usr/bin/env python3
-"""Translate a practical subset of GCC/G++ command lines to MSVC cl.exe.
+"""Translate common GCC/MinGW compiler invocations to MSVC cl.exe.
 
-Windows-only runner. It discovers VS 2022 Build Tools, creates a VS developer
-environment, prints the translated command, and optionally executes it.
-
-Examples:
-  py gcc2cl.py --arch x64 -- "g++ -std=c++17 -O2 -Iinclude -DAPP=1 -c src\\main.cpp -o build\\main.obj"
-  py gcc2cl.py --arch x64_x86 --command "gcc main.c -o app.exe -Llib -lfoo"
-  py gcc2cl.py --dry-run -- "g++ -Wall -Werror main.cpp -o app.exe"
+This translates command-line conventions; it cannot convert GCC-only source
+extensions, ABIs, object files, archives, or libraries. Use --dry-run to audit
+the generated command and warnings before enabling it as a PATH shim.
 """
 from __future__ import annotations
-import argparse, datetime, os, re, shlex, subprocess, sys
+import argparse
+import datetime
+import os
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 
-
+CPP_SUFFIXES = {'.cc', '.cpp', '.cxx', '.c++', '.ii'}
+MSVC_SYSTEM_LIBS = {
+    'ws2_32', 'advapi32', 'user32', 'gdi32', 'shell32', 'ole32',
+    'oleaut32', 'uuid', 'bcrypt', 'crypt32', 'comdlg32', 'imm32',
+    'version', 'winmm', 'shlwapi', 'setupapi', 'iphlpapi', 'psapi',
+}
 def split_command(s: str) -> list[str]:
-    # Windows command-line quoting is close enough to this for normal compiler
-    # commands; response files are expanded separately below.
+    """Parse a normal Windows compiler command sufficiently for quoted paths."""
     return shlex.split(s, posix=False)
 
 
-def expand_response_files(args: list[str]) -> list[str]:
-    out = []
-    for a in args:
-        if a.startswith('@') and len(a) > 1:
-            p = Path(a[1:].strip('"'))
-            if p.exists():
-                out.extend(expand_response_files(split_command(p.read_text(encoding='utf-8', errors='replace'))))
-            else:
-                out.append(a)
-        else:
-            out.append(a)
-    return out
+def expand_response_files(args: list[str], base: Path | None = None, seen=None) -> list[str]:
+    """Expand GCC @response files, resolving nested files relative to the cwd."""
+    seen = set() if seen is None else seen
+    result: list[str] = []
+    for arg in args:
+        if not arg.startswith('@') or len(arg) == 1:
+            result.append(arg)
+            continue
+        raw = arg[1:].strip('"')
+        path = Path(raw)
+        if not path.is_absolute() and base:
+            path = base / path
+        path = path.resolve()
+        if path in seen:
+            raise ValueError(f'cyclic response file: {path}')
+        if not path.is_file():
+            result.append(arg)
+            continue
+        seen.add(path)
+        text = path.read_text(encoding='utf-8', errors='replace')
+        result.extend(expand_response_files(split_command(text), path.parent, seen))
+        seen.remove(path)
+    return result
 
 
-def take_value(args: list[str], i: int, prefix: str):
-    a = args[i]
-    if a == prefix:
-        if i + 1 >= len(args): raise ValueError(f"{prefix} needs a value")
+def take_value(args: list[str], i: int, prefix: str) -> tuple[str, int]:
+    arg = args[i]
+    if arg == prefix:
+        if i + 1 >= len(args):
+            raise ValueError(f'{prefix} needs a value')
         return args[i + 1], i + 2
-    return a[len(prefix):], i + 1
+    return arg[len(prefix):], i + 1
 
 
-def translate(args: list[str], compiler: str = 'cl') -> tuple[list[str], list[str]]:
-    """Return (cl arguments, warnings). The first argument (gcc/g++) is removed."""
-    args = expand_response_files(args[:])
-    actual_compiler = args[0].lower() if args and not args[0].startswith(('-', '/')) else compiler.lower()
-    if args and not args[0].startswith('-') and not args[0].startswith('/'):
+def compiler_basename(value: str) -> str:
+    value = value.strip('"').replace('\\', '/')
+    return Path(value).name.lower().removesuffix('.exe')
+
+
+def add_library(value: str, link: list[str], warnings: list[str]) -> None:
+    value = value.strip('"')
+    name = value[2:] if value.startswith('-l') else value
+    low = name.lower()
+    if low == 'm' or low in {'mingw32', 'mingwex', 'gcc', 'gcc_s', 'gcc_eh', 'msvcrt'}:
+        warnings.append(f'-l{name}: omitted; supplied by MSVC/Windows runtime')
+    elif low == 'stdc++':
+        warnings.append('-lstdc++ cannot be converted: rebuild the C++ library as an MSVC .lib')
+    elif low in MSVC_SYSTEM_LIBS:
+        link.append(name + '.lib')
+    elif low.endswith('.lib'):
+        link.append(name)
+    elif low.endswith(('.a', '.o')):
+        warnings.append(f'{value}: GNU archive/object is incompatible with MSVC; rebuild it as .lib/.obj')
+        link.append(value)
+    else:
+        link.append(name + '.lib')
+
+
+def translate_linker_option(value: str, link: list[str], warnings: list[str]) -> None:
+    """Translate common -Wl,foo linker options."""
+    value = value.strip()
+    if value.startswith('--subsystem,'):
+        link.append('/SUBSYSTEM:' + value.split(',', 1)[1].upper())
+    elif value.startswith('--out-implib,'):
+        link.append('/IMPLIB:' + value.split(',', 1)[1])
+    elif value.startswith('--out-implib='):
+        link.append('/IMPLIB:' + value.split('=', 1)[1])
+    elif value.startswith('--entry,'):
+        link.append('/ENTRY:' + value.split(',', 1)[1])
+    elif value.startswith('--entry='):
+        link.append('/ENTRY:' + value.split('=', 1)[1])
+    elif value in ('--debug', '-g'):
+        link.append('/DEBUG')
+    elif value in ('-s', '--strip-all'):
+        link.append('/RELEASE')
+    elif value in ('--enable-auto-import', '--enable-runtime-pseudo-reloc'):
+        warnings.append(f'{value}: GNU linker behavior is not needed/available in MSVC; omitted')
+    elif value.startswith('-Map,'):
+        link.append('/MAP:' + value.split(',', 1)[1])
+    elif value.startswith('--whole-archive'):
+        link.append('/WHOLEARCHIVE')
+    elif value.startswith('--no-whole-archive'):
+        warnings.append(f'{value}: MSVC has no global inverse switch; library order may need adjustment')
+    elif value.startswith('-z'):
+        warnings.append(f'{value}: GNU ld option is not translated')
+    else:
+        warnings.append(f'-Wl,{value}: GNU linker option is not translated')
+
+
+def translate(args: list[str], compiler: str = 'g++') -> tuple[list[str], list[str]]:
+    """Return cl arguments and warnings for one GCC/G++ invocation."""
+    args = expand_response_files(args[:], Path.cwd())
+    actual = compiler_basename(args[0]) if args and not args[0].startswith(('-', '/')) else compiler_basename(compiler)
+    if args and not args[0].startswith(('-', '/')):
         args = args[1:]
 
-    out, link, warnings = [], [], []
-    sources = []
+    out: list[str] = []
+    link: list[str] = []
+    sources: list[str] = []
+    warnings: list[str] = []
     compile_only = False
-    output = None
-    object_output = None
-    is_cpp = actual_compiler in ('g++', 'c++', 'clang++')
-    forced_c = False
-    forced_cpp = False
+    output: str | None = None
+    language: str | None = 'c++' if actual in {'g++', 'c++', 'clang++'} else None
+    end_options = False
     i = 0
+
     while i < len(args):
         a = args[i]
-        if a in ('-c',): compile_only = True; i += 1; continue
-        if a in ('-E',): out.append('/P'); i += 1; continue
-        if a in ('-S',): warnings.append('-S (assembly-only) is not supported by cl; use /FA'); out.append('/FA'); i += 1; continue
-        if a in ('-v', '--verbose'): out.append('/Bv'); i += 1; continue
-        if a in ('-shared',): link.append('/DLL'); i += 1; continue
-        if a in ('-static',): warnings.append('-static has no direct MSVC equivalent'); i += 1; continue
-        if a in ('-pthread',): warnings.append('-pthread ignored: Windows CRT/thread APIs are linked differently'); i += 1; continue
-        if a in ('-fPIC', '-fpic', '-fPIE', '-fpie'): i += 1; continue
+        if end_options:
+            sources.append(a); i += 1; continue
+        if a == '--':
+            end_options = True; i += 1; continue
+        if a == '-c':
+            compile_only = True; i += 1; continue
+        if a in ('-E',):
+            out.append('/P'); i += 1; continue
+        if a == '-S':
+            out.append('/FA'); warnings.append('-S generates MSVC assembly syntax, not GNU assembly'); i += 1; continue
+        if a in ('-v', '--verbose'):
+            out.append('/Bv'); i += 1; continue
+        if a in ('-shared',):
+            link.append('/DLL'); i += 1; continue
+        if a in ('-mwindows',):
+            link.append('/SUBSYSTEM:WINDOWS'); i += 1; continue
+        if a in ('-municode',):
+            link.append('/ENTRY:wmainCRTStartup'); i += 1; continue
+        if a in ('-static', '-static-libgcc', '-static-libstdc++', '-shared-libgcc'):
+            warnings.append(f'{a}: no direct MSVC equivalent; MSVC CRT selection is controlled by /MD, /MDd, /MT, or /MTd'); i += 1; continue
+        if a == '-pthread':
+            warnings.append('-pthread: Windows thread support is supplied by the CRT/Win32; omitted'); i += 1; continue
+        if a in ('-fPIC', '-fpic', '-fPIE', '-fpie', '-fno-PIE', '-fno-pie'):
+            i += 1; continue
+        if a.startswith('-Wl,'):
+            payload = a[4:]
+            # These GNU ld options contain a comma-separated value; do not
+            # split them into two unrelated options.
+            if payload.startswith(('--subsystem,', '--out-implib,', '--entry,', '-Map,')):
+                translate_linker_option(payload, link, warnings)
+            else:
+                for item in payload.split(','):
+                    translate_linker_option(item, link, warnings)
+            i += 1; continue
+        if a == '-Xlinker':
+            value, i = take_value(args, i, a); translate_linker_option(value, link, warnings); continue
         if a.startswith(('-I', '/I')):
-            v, i = take_value(args, i, '-I' if a.startswith('-I') else '/I'); out.append('/I' + v); continue
-        if a in ('-isystem',):
-            v, i = take_value(args, i, a); out.append('/I' + v); warnings.append('GCC system include treated as normal /I'); continue
+            value, i = take_value(args, i, '-I' if a.startswith('-I') else '/I'); out.append('/I' + value); continue
+        if a == '-isystem':
+            value, i = take_value(args, i, a); out.append('/I' + value); warnings.append('-isystem treated as normal /I'); continue
+        if a.startswith('-isystem') and len(a) > len('-isystem'):
+            out.append('/I' + a[len('-isystem'):]); warnings.append('-isystem treated as normal /I'); i += 1; continue
         if a.startswith('-D'):
-            v, i = take_value(args, i, '-D'); out.append('/D' + v); continue
+            value, i = take_value(args, i, '-D'); out.append('/D' + value); continue
         if a.startswith('-U'):
-            v, i = take_value(args, i, '-U'); out.append('/U' + v); continue
+            value, i = take_value(args, i, '-U'); out.append('/U' + value); continue
         if a == '-include':
-            v, i = take_value(args, i, a); out.append('/FI' + v); continue
-        if a.startswith('-include') and len(a) > 8: out.append('/FI' + a[8:]); i += 1; continue
+            value, i = take_value(args, i, a); out.append('/FI' + value); continue
+        if a.startswith('-include') and len(a) > len('-include'):
+            out.append('/FI' + a[len('-include'):]); i += 1; continue
         if a in ('-o',):
             output, i = take_value(args, i, a); continue
-        if a.startswith('-o') and len(a) > 2: output = a[2:]; i += 1; continue
-        if a in ('-MF', '-MT'):
-            v, i = take_value(args, i, a); warnings.append(f'{a} dependency output is not translated'); continue
+        if a.startswith('-o') and len(a) > 2:
+            output = a[2:]; i += 1; continue
+        if a in ('-L',):
+            value, i = take_value(args, i, a); link.append('/LIBPATH:' + value); continue
         if a.startswith('-L'):
-            v, i = take_value(args, i, '-L'); link.append('/LIBPATH:' + v); continue
+            value, i = take_value(args, i, '-L'); link.append('/LIBPATH:' + value); continue
         if a == '-l':
-            v, i = take_value(args, i, a)
-            lib = v[2:] if v.startswith('-l') else v
-            if lib.lower() in ('m', 'mingw32', 'mingwex', 'gcc', 'gcc_s', 'gcc_eh', 'msvcrt'):
-                # These are supplied by the selected MSVC CRT/toolchain, or
-                # libm functionality is already in the Windows CRT.
-                warnings.append(f'-l{lib}: omitted; supplied by MSVC/Windows runtime')
-            elif lib.lower() in ('ws2_32', 'advapi32', 'user32', 'gdi32', 'shell32', 'ole32', 'oleaut32', 'uuid', 'bcrypt'):
-                link.append(lib + '.lib')
-            else:
-                link.append(lib if lib.lower().endswith('.lib') else lib + '.lib')
-            continue
+            value, i = take_value(args, i, a); add_library(value, link, warnings); continue
         if a.startswith('-l'):
-            lib = a[2:]
-            if lib.lower() in ('m', 'mingw32', 'mingwex', 'gcc', 'gcc_s', 'gcc_eh', 'msvcrt'):
-                warnings.append(f'{a}: omitted; supplied by MSVC/Windows runtime')
-            else:
-                link.append(lib if lib.lower().endswith('.lib') else lib + '.lib')
-            i += 1; continue
+            add_library(a, link, warnings); i += 1; continue
         if a.startswith('-std='):
             std = a.split('=', 1)[1].lower()
-            if std in ('c99', 'gnu99', 'c11', 'gnu11', 'c17', 'gnu17'):
-                out.append('/TC')
-                is_cpp = False
-                forced_c = True
-                forced_cpp = False
-                warnings.append(f'{a}: MSVC uses its own C language mode; /TC selects C compilation')
-            elif std in ('c++14', 'gnu++14'):
-                out.append('/std:c++14'); is_cpp = True; forced_cpp = True; forced_c = False
-            elif std in ('c++17', 'gnu++17'):
-                out.append('/std:c++17'); is_cpp = True; forced_cpp = True; forced_c = False
-            elif std in ('c++20', 'gnu++20'):
-                out.append('/std:c++20'); is_cpp = True; forced_cpp = True; forced_c = False
-            elif std in ('c++latest',):
-                out.append('/std:c++latest'); is_cpp = True; forced_cpp = True; forced_c = False
-            else: warnings.append(f'{a} may not be supported by this cl')
+            if std in {'c89', 'gnu89', 'c99', 'gnu99', 'c11', 'gnu11', 'c17', 'gnu17'}:
+                language = 'c'; out.append('/TC')
+                warnings.append(f'{a}: MSVC does not implement GCC C dialects exactly; /TC selects C compilation')
+            elif std in {'c++11', 'gnu++11'}:
+                language = 'c++'; out.append('/std:c++14'); warnings.append(f'{a}: nearest supported MSVC mode is /std:c++14')
+            elif std in {'c++14', 'gnu++14'}:
+                language = 'c++'; out.append('/std:c++14')
+            elif std in {'c++17', 'gnu++17'}:
+                language = 'c++'; out.append('/std:c++17')
+            elif std in {'c++20', 'gnu++20'}:
+                language = 'c++'; out.append('/std:c++20')
+            elif std in {'c++23', 'gnu++23', 'c++latest'}:
+                language = 'c++'; out.append('/std:c++latest')
+            else:
+                warnings.append(f'{a}: unsupported language dialect')
             i += 1; continue
+        if a == '-x':
+            value, i = take_value(args, i, a)
+            if value in ('c', 'c-header'): language = 'c'; out.append('/TC')
+            elif value in ('c++', 'c++-header', 'cxx'): language = 'c++'; out.append('/TP')
+            elif value == 'none': language = None
+            else: warnings.append(f'-x {value}: language selection not translated')
+            continue
         if a in ('-O0',): out.append('/Od'); i += 1; continue
         if a in ('-O1', '-Og'): out.append('/O1'); i += 1; continue
-        if a in ('-O2', '-O3', '-Ofast'): out.append('/O2'); i += 1; continue
-        if a in ('-g', '-ggdb'): out.append('/Zi'); i += 1; continue
-        if a in ('-Wall',): out.append('/W4'); i += 1; continue
-        if a in ('-Wextra',): out.append('/W4'); i += 1; continue
-        if a in ('-Werror',): out.append('/WX'); i += 1; continue
+        if a in ('-O2', '-O3', '-Ofast', '-Os'): out.append('/O2'); i += 1; continue
+        if a in ('-g', '-ggdb', '-g3'): out.append('/Zi'); i += 1; continue
+        if a in ('-Wall', '-Wextra'): out.append('/W4'); i += 1; continue
+        if a == '-Werror': out.append('/WX'); i += 1; continue
+        if a in ('-Wno-unused-result', '-Wno-unused-variable', '-Wno-uninitialized', '-Wno-sign-compare'):
+            i += 1; continue
+        if a in ('-Wuninitialized', '-Winvalid-pch', '-Winvalid-offsetof'):
+            warnings.append(f'{a}: no direct MSVC equivalent; omitted'); i += 1; continue
+        if a in ('-fopenmp',): out.append('/openmp'); i += 1; continue
         if a in ('-fexceptions',): out.append('/EHsc'); i += 1; continue
         if a in ('-fno-exceptions',): out.append('/EHs-c-'); i += 1; continue
         if a in ('-frtti',): out.append('/GR'); i += 1; continue
         if a in ('-fno-rtti',): out.append('/GR-'); i += 1; continue
-        if a in ('-MD', '-MMD', '-MDd', '-MP', '-MM', '-M'):
-            warnings.append(f'{a}: GCC dependency generation is not a runtime-library option; dependency emission is not yet translated')
-            i += 1; continue
-        if a in ('-MT', '-MF'):
-            v, i = take_value(args, i, a)
-            warnings.append(f'{a} {v}: GCC dependency output is not yet translated')
-            continue
-        if a in ('-fopenmp',): out.append('/openmp'); i += 1; continue
-        if a in ('-m64', '-m32'): warnings.append(f'{a} is selected by --arch, not the command line'); i += 1; continue
-        if a.startswith('-f') or a.startswith('-W'):
+        if a in ('-MD', '-MMD', '-MP', '-MM', '-M'):
+            warnings.append(f'{a}: dependency generation is not translated; use /showIncludes with a dependency parser'); i += 1; continue
+        if a in ('-MF', '-MT'):
+            value, i = take_value(args, i, a); warnings.append(f'{a} {value}: dependency output is not translated'); continue
+        if a in ('-MDd',):
+            warnings.append('-MDd: not a standard GCC dependency flag; omitted'); i += 1; continue
+        if a in ('-m64', '-m32'):
+            warnings.append(f'{a}: target architecture is selected by --arch'); i += 1; continue
+        if a.startswith(('-f', '-W')):
             warnings.append(f'ignored or unsupported GCC option: {a}'); i += 1; continue
         if a.startswith('-'):
-            warnings.append(f'unknown GCC option retained as warning: {a}'); i += 1; continue
-        # A linker option in GCC syntax that was not handled above.
-        if a.lower().endswith(('.c', '.cc', '.cpp', '.cxx', '.c++', '.cxx', '.i', '.ii', '.s', '.asm', '.obj', '.o', '.a', '.lib')):
-            sources.append(a)
-        else:
-            sources.append(a)  # headers and unusual paths are safest to pass through
-        i += 1
+            warnings.append(f'ignored or unsupported GCC option: {a}'); i += 1; continue
+        if a.lower().endswith(('.a', '.o')):
+            warnings.append(f'{a}: GNU archive/object is incompatible with MSVC; rebuild it as .lib/.obj')
+        sources.append(a); i += 1
 
-    if not forced_c and not forced_cpp:
-        # GCC chooses the language from the source suffix when the driver is
-        # gcc rather than g++. cl defaults to C, so preserve that behavior.
-        if any(Path(s.strip('"')).suffix.lower() in ('.cc', '.cpp', '.cxx', '.c++', '.ii') for s in sources):
-            is_cpp = True
-    if is_cpp: out.append('/TP')
-    # Enforce one language mode even when the original command identifies a
-    # C++ compiler but explicitly requests a C standard such as -std=c99.
-    # This also protects against a build system supplying /TC or /TP itself.
-    has_tc = any(x.lower() == '/tc' for x in out)
-    has_tp = any(x.lower() == '/tp' for x in out)
-    if has_tc and has_tp:
-        if not is_cpp:
-            out = [x for x in out if x.lower() != '/tp']
-        else:
-            out = [x for x in out if x.lower() != '/tc']
+    if language is None:
+        if any(Path(s.strip('"')).suffix.lower() in CPP_SUFFIXES for s in sources): language = 'c++'
+        elif actual in {'g++', 'c++', 'clang++'}: language = 'c++'
+    # cl defaults to C, so only add /TP when C++ was selected. Remove an
+    # accidental opposing switch supplied by the original command.
+    if language == 'c++':
+        out = [x for x in out if x.upper() != '/TC']
+        if not any(x.upper() == '/TP' for x in out): out.append('/TP')
+    elif language == 'c':
+        out = [x for x in out if x.upper() != '/TP']
+        if not any(x.upper() == '/TC' for x in out): out.append('/TC')
+
     if compile_only: out.append('/c')
-    # /Fo is only safe for one source. For a multi-source GCC link command,
-    # let cl choose intermediate object names and use /Fe for the executable.
-    if compile_only and output:
-        object_output = output
+    if output and compile_only and len(sources) == 1:
+        out.append('/Fo:' + output)
     elif output:
         out.append('/Fe:' + output)
-    if object_output and len(sources) == 1:
-        out.append('/Fo:' + object_output)
-    elif object_output and len(sources) > 1:
-        warnings.append('GCC -o with -c and multiple sources cannot map to one /Fo; omitted /Fo')
+    elif not compile_only:
+        warnings.append('no -o output specified; cl will use its default executable name')
     out.extend(sources)
-    if link and not compile_only: out.append('/link'); out.extend(link)
+    if link and not compile_only:
+        out.append('/link'); out.extend(link)
     return out, warnings
 
 
@@ -190,62 +280,52 @@ def find_vsdevcmd() -> str:
     candidates = []
     pf86 = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
     pf = os.environ.get('ProgramFiles', r'C:\Program Files')
-    candidates += [Path(pf86) / 'Microsoft Visual Studio' / '2022' / x / 'Common7' / 'Tools' / 'VsDevCmd.bat' for x in ('BuildTools','Community','Professional','Enterprise')]
-    candidates += [Path(pf) / 'Microsoft Visual Studio' / '2022' / x / 'Common7' / 'Tools' / 'VsDevCmd.bat' for x in ('BuildTools','Community','Professional','Enterprise')]
-    for p in candidates:
-        if p.exists(): return str(p)
-    raise FileNotFoundError('VsDevCmd.bat not found. Install VS 2022 Build Tools with C++ tools, or set VSDEVCMD.')
+    for root in (pf86, pf):
+        for edition in ('BuildTools', 'Community', 'Professional', 'Enterprise'):
+            candidates.append(Path(root) / 'Microsoft Visual Studio' / '2022' / edition / 'Common7' / 'Tools' / 'VsDevCmd.bat')
+    for candidate in candidates:
+        if candidate.is_file(): return str(candidate)
+    raise FileNotFoundError('VsDevCmd.bat not found. Install VS 2022 Build Tools with C++ tools and a Windows SDK, or set VSDEVCMD.')
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description='Translate and run GCC/G++ commands using VS 2022 cl.exe')
-    ap.add_argument('--arch', choices=['x64', 'x64_x86'], default=os.environ.get('GCC2CL_ARCH', 'x64'), help='x64 target, or x64 host targeting x86')
-    ap.add_argument('--compiler', default='g++', help='original compiler name: gcc or g++')
-    ap.add_argument('--command', help='GCC command as one quoted string')
-    ap.add_argument('--dry-run', action='store_true', help='print translation without executing')
-    ap.add_argument('rest', nargs=argparse.REMAINDER, help='use -- followed by GCC arguments')
-    ns = ap.parse_args()
+    parser = argparse.ArgumentParser(description='Translate and run GCC/G++ commands using VS 2022 cl.exe')
+    parser.add_argument('--arch', choices=['x64', 'x64_x86'], default=os.environ.get('GCC2CL_ARCH', 'x64'))
+    parser.add_argument('--compiler', default='g++')
+    parser.add_argument('--command')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('rest', nargs=argparse.REMAINDER)
+    ns = parser.parse_args()
     raw = split_command(ns.command) if ns.command else ns.rest
     if raw and raw[0] == '--': raw = raw[1:]
-    # In PowerShell/cmd, a quoted command after `--` arrives as one argument.
-    # Expand that common form, while leaving a real multi-argument invocation intact.
-    if not ns.command and len(raw) == 1 and any(c.isspace() for c in raw[0]):
-        raw = split_command(raw[0])
-    if not raw: ap.error('supply --command "..." or -- gcc/g++ arguments')
-    try: translated, warnings = translate(raw, ns.compiler)
-    except ValueError as e: ap.error(str(e))
-    translated_text = 'cl ' + subprocess.list2cmdline(translated)
-    print(translated_text)
-    # Optional audit log for PATH-shim deployments. Command lines can contain
-    # secrets, so logging is opt-in via GCC2CL_LOG.
+    if not ns.command and len(raw) == 1 and any(c.isspace() for c in raw[0]): raw = split_command(raw[0])
+    if not raw: parser.error('supply --command "..." or -- gcc/g++ arguments')
+    try:
+        translated, warnings = translate(raw, ns.compiler)
+    except ValueError as exc:
+        parser.error(str(exc))
+    command_text = 'cl ' + subprocess.list2cmdline(translated)
+    print(command_text)
+    for warning in warnings: print('warning: ' + warning, file=sys.stderr)
     log_path = os.environ.get('GCC2CL_LOG')
     if log_path:
         try:
             with open(log_path, 'a', encoding='utf-8') as log:
                 stamp = datetime.datetime.now().astimezone().isoformat(timespec='seconds')
-                log.write(f'[{stamp}] {subprocess.list2cmdline(raw)} => {translated_text}\\n')
-        except OSError as e:
-            print(f'warning: cannot write GCC2CL_LOG: {e}', file=sys.stderr)
-    for w in warnings: print('warning: ' + w, file=sys.stderr)
+                log.write(f'[{stamp}] {subprocess.list2cmdline(raw)} => {command_text}\n')
+        except OSError as exc:
+            print(f'warning: cannot write GCC2CL_LOG: {exc}', file=sys.stderr)
     if ns.dry_run: return 0
+    configured = os.environ.get('VSDEVCMD', '').strip().replace('\\"', '"').strip('"')
     try:
-        configured_dev = os.environ.get('VSDEVCMD', '').strip()
-        # VSDEVCMD is sometimes stored by users as \"C:\\...\\VsDevCmd.bat\"
-        # or as the literal escaped form \\"C:\\...\\\". Normalize both.
-        if configured_dev:
-            dev = configured_dev.replace('\\"', '"').strip().strip('"')
-            if not Path(dev).is_file():
-                print(f'warning: VSDEVCMD does not point to a file; ignoring it: {configured_dev}', file=sys.stderr)
-                dev = find_vsdevcmd()
-        else:
-            dev = find_vsdevcmd()
-    except FileNotFoundError as e: print('error:', e, file=sys.stderr); return 2
-    archarg = '-arch=x64 -host_arch=x64' if ns.arch == 'x64' else '-arch=x86 -host_arch=x64'
-    # Let cmd.exe parse the complete command string. Passing this as one /c
-    # argument through subprocess' Windows quoting layer can turn quotes into
-    # literal backslash-quote characters when the VS path contains spaces.
-    command = 'call ' + subprocess.list2cmdline([dev]) + ' ' + archarg + ' >nul && cl ' + subprocess.list2cmdline(translated)
+        dev = configured if configured and Path(configured).is_file() else find_vsdevcmd()
+    except FileNotFoundError as exc:
+        print('error: ' + str(exc), file=sys.stderr); return 2
+    arch = '-arch=x64 -host_arch=x64' if ns.arch == 'x64' else '-arch=x86 -host_arch=x64'
     print('Using VS developer environment: ' + dev)
-    return subprocess.call(command, shell=True)
+    cmd = 'call ' + subprocess.list2cmdline([dev]) + ' ' + arch + ' >nul && cl ' + subprocess.list2cmdline(translated)
+    return subprocess.call(cmd, shell=True)
 
-if __name__ == '__main__': raise SystemExit(main())
+
+if __name__ == '__main__':
+    raise SystemExit(main())
