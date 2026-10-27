@@ -102,7 +102,21 @@ python gcc2cl.py --dry-run -- "gcc -Wuninitialized -std=c99 main.c Task1.c -o Ta
 python gcc2cl.py --dry-run -- "g++ -std=c++17 -O2 -Wall main.cpp -o app.exe"
 ```
 
-The first command should omit `m.lib`, because MSVC/Windows supplies the normal C math functions. Actual compilation and linking require Windows, Visual Studio Build Tools, the Windows SDK, compatible source code, and MSVC-compatible libraries. The previous translation test suite was run during development and removed before preparing the release branch.
+Use `--explain` for a readable summary:
+
+```powershell
+python gcc2cl.py --explain -- "gcc -std=c99 main.c -o app.exe -lm"
+```
+
+Use `--strict` when an incomplete translation must stop the build instead of continuing:
+
+```powershell
+python gcc2cl.py --strict -- "gcc -fsanitize=address main.c -o app.exe"
+```
+
+The first command should omit `m.lib`, because MSVC/Windows supplies the normal C math functions. Actual compilation and linking require Windows, Visual Studio Build Tools, the Windows SDK, compatible source code, and MSVC-compatible libraries. The previous translation test suite was run during development and removed before preparing the release branch. The current workspace validation uses Python syntax checks and dry-run translation checks.
+
+`--strict` is intentionally conservative: it rejects unsupported or semantically incomplete options such as GNU linker options that have no MSVC equivalent, incompatible `.a` archives, and GCC-only compiler features. It does not reject harmless compatibility notes such as omitting `-lm`.
 
 ## Important compatibility boundary
 

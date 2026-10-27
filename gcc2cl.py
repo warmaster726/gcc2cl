@@ -288,12 +288,23 @@ def find_vsdevcmd() -> str:
     raise FileNotFoundError('VsDevCmd.bat not found. Install VS 2022 Build Tools with C++ tools and a Windows SDK, or set VSDEVCMD.')
 
 
+def warning_is_unsupported(warning: str) -> bool:
+    """Return whether a warning means semantic GCC behavior was not preserved."""
+    markers = (
+        'unsupported', 'not translated', 'incompatible', 'cannot be converted',
+        'no direct', 'not implement', 'not available', 'not a standard GCC',
+    )
+    return any(marker in warning.lower() for marker in markers)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='Translate and run GCC/G++ commands using VS 2022 cl.exe')
     parser.add_argument('--arch', choices=['x64', 'x64_x86'], default=os.environ.get('GCC2CL_ARCH', 'x64'))
     parser.add_argument('--compiler', default='g++')
     parser.add_argument('--command')
-    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--dry-run', action='store_true', help='print the translation without executing cl.exe')
+    parser.add_argument('--explain', action='store_true', help='print a readable translation summary and do not execute')
+    parser.add_argument('--strict', action='store_true', help='fail instead of running when an unsupported translation is detected')
     parser.add_argument('rest', nargs=argparse.REMAINDER)
     ns = parser.parse_args()
     raw = split_command(ns.command) if ns.command else ns.rest
@@ -305,8 +316,27 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
     command_text = 'cl ' + subprocess.list2cmdline(translated)
-    print(command_text)
-    for warning in warnings: print('warning: ' + warning, file=sys.stderr)
+    if ns.explain:
+        print('gcc2cl translation summary')
+        print('  original:   ' + subprocess.list2cmdline(raw))
+        print('  translated: ' + command_text)
+        if warnings:
+            print('  diagnostics:')
+            for warning in warnings:
+                label = 'UNSUPPORTED' if warning_is_unsupported(warning) else 'NOTE'
+                print(f'    [{label}] {warning}')
+        else:
+            print('  diagnostics: none')
+    else:
+        print(command_text)
+    for warning in warnings:
+        print('warning: ' + warning, file=sys.stderr)
+    unsupported = [warning for warning in warnings if warning_is_unsupported(warning)]
+    if ns.strict and unsupported:
+        print('error: strict mode refused to execute a semantically incomplete translation:', file=sys.stderr)
+        for warning in unsupported:
+            print('  ' + warning, file=sys.stderr)
+        return 2
     log_path = os.environ.get('GCC2CL_LOG')
     if log_path:
         try:
@@ -315,7 +345,7 @@ def main() -> int:
                 log.write(f'[{stamp}] {subprocess.list2cmdline(raw)} => {command_text}\n')
         except OSError as exc:
             print(f'warning: cannot write GCC2CL_LOG: {exc}', file=sys.stderr)
-    if ns.dry_run: return 0
+    if ns.dry_run or ns.explain: return 0
     configured = os.environ.get('VSDEVCMD', '').strip().replace('\\"', '"').strip('"')
     try:
         dev = configured if configured and Path(configured).is_file() else find_vsdevcmd()
