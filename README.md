@@ -6,9 +6,9 @@
 
 1. Windows 10/11.
 2. Python 3.9 or newer available as `py` or `python`.
-3. Visual Studio 2022 Build Tools installed with **Desktop development with C++**, including the MSVC compiler and a Windows SDK.
+3. Visual Studio 2022 or later Build Tools installed with **Desktop development with C++**, including the MSVC compiler and a Windows SDK.
 
-The script searches the standard VS 2022 locations. If VS is installed elsewhere, set:
+The script uses Microsoft's `vswhere.exe` when available to locate the newest installed Visual Studio instance with the MSVC C++ tools. It is compatible with Visual Studio 2022 and later side-by-side installations. If `vswhere.exe` is unavailable, it falls back to conventional Visual Studio installation paths. If VS is installed elsewhere, set:
 
 ```bat
 set VSDEVCMD=D:\VS\2022\BuildTools\Common7\Tools\VsDevCmd.bat

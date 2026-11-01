@@ -277,15 +277,50 @@ def translate(args: list[str], compiler: str = 'g++') -> tuple[list[str], list[s
 
 
 def find_vsdevcmd() -> str:
-    candidates = []
+    """Find the newest installed VS developer environment.
+
+    Prefer Microsoft's vswhere discovery mechanism so this continues to work
+    with VS 2022 and later installations without hard-coding a year or edition.
+    Fall back to conventional installation paths when vswhere is unavailable.
+    """
     pf86 = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
     pf = os.environ.get('ProgramFiles', r'C:\Program Files')
+    vswhere_candidates = [
+        Path(pf86) / 'Microsoft Visual Studio' / 'Installer' / 'vswhere.exe',
+        Path(pf) / 'Microsoft Visual Studio' / 'Installer' / 'vswhere.exe',
+    ]
+    for vswhere in vswhere_candidates:
+        if not vswhere.is_file():
+            continue
+        try:
+            result = subprocess.run(
+                [str(vswhere), '-latest', '-products', '*',
+                 '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+                 '-property', 'installationPath'],
+                check=True, capture_output=True, text=True, timeout=15,
+            )
+            install_path = result.stdout.strip().splitlines()
+            if install_path:
+                candidate = Path(install_path[-1]) / 'Common7' / 'Tools' / 'VsDevCmd.bat'
+                if candidate.is_file():
+                    return str(candidate)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    # Fallback for VS 2022 and future side-by-side layouts. Search all year
+    # directories and editions rather than assuming only BuildTools exists.
+    candidates = []
     for root in (pf86, pf):
-        for edition in ('BuildTools', 'Community', 'Professional', 'Enterprise'):
-            candidates.append(Path(root) / 'Microsoft Visual Studio' / '2022' / edition / 'Common7' / 'Tools' / 'VsDevCmd.bat')
-    for candidate in candidates:
-        if candidate.is_file(): return str(candidate)
-    raise FileNotFoundError('VsDevCmd.bat not found. Install VS 2022 Build Tools with C++ tools and a Windows SDK, or set VSDEVCMD.')
+        base = Path(root) / 'Microsoft Visual Studio'
+        if base.is_dir():
+            candidates.extend(base.glob('*/*/Common7/Tools/VsDevCmd.bat'))
+    if candidates:
+        candidates.sort(key=lambda p: str(p).lower(), reverse=True)
+        return str(candidates[0])
+    raise FileNotFoundError(
+        'VsDevCmd.bat not found. Install Visual Studio 2022 or later with '
+        'Desktop development with C++, or set VSDEVCMD.'
+    )
 
 
 def warning_is_unsupported(warning: str) -> bool:
